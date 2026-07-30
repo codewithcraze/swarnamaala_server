@@ -1,0 +1,22 @@
+{
+  "name": "swarnamaala-crm-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CRM backend for swarnamaala.in - admin dashboard for users, orders, referrals and blog.",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "make-admin": "node src/makeAdmin.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.729.0",
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.5",
+    "multer": "^1.4.5-lts.1"
+  }
+}
