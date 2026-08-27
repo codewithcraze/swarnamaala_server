@@ -43,11 +43,26 @@ const OrderSchema = new Schema(
     total: Number,
     amount: Number,
     currency: String,
+    couponCode: String,
+    discount: { type: Number, default: 0 },
     images: [String],
     note: String,
+    // Internal note added by CRM admins (not visible to the customer).
+    adminNote: String,
     shippingAddress: ShippingAddressSchema,
     status: String,
     paymentStatus: String,
+
+    // Razorpay payment tracking
+    razorpayOrderId: { type: String, index: true, sparse: true },
+    razorpayPaymentId: { type: String, sparse: true },
+    razorpaySignature: String,
+    paidAt: Date,
+
+    // Failed payment tracking
+    paymentFailedAt: Date,
+    paymentFailureReason: String,
+
     referrer: { type: Schema.Types.ObjectId, ref: "User", index: true },
     referralReward: { type: Number, default: 0 },
     referralCredited: { type: Boolean, default: false },
@@ -71,6 +86,22 @@ const BlogSchema = new Schema(
   { timestamps: true }
 );
 
+const CouponSchema = new Schema(
+  {
+    code: { type: String, required: true, unique: true, uppercase: true, trim: true, index: true },
+    type: { type: String, enum: ["percent", "flat"], required: true },
+    value: { type: Number, required: true, min: 0 },
+    maxDiscount: { type: Number, default: 0, min: 0 },
+    minOrderValue: { type: Number, default: 0, min: 0 },
+    usageLimit: { type: Number, default: 0, min: 0 },
+    usedCount: { type: Number, default: 0, min: 0 },
+    active: { type: Boolean, default: true, index: true },
+    expiresAt: { type: Date, default: null },
+  },
+  { timestamps: true }
+);
+
 export const User = models.User || model("User", UserSchema);
 export const Order = models.Order || model("Order", OrderSchema);
 export const Blog = models.Blog || model("Blog", BlogSchema);
+export const Coupon = models.Coupon || model("Coupon", CouponSchema);

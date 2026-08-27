@@ -3,10 +3,12 @@ import express from "express";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import { connectDB } from "./db.js";
-import { User, Order, Blog } from "./models.js";
+import { User, Order, Blog, Coupon } from "./models.js";
 import { signAdminToken, requireAdmin } from "./auth.js";
-import { uploadBuffer } from "./s3.js";
+import { uploadBuffer, getS3Object, keyFromImageUrl, EXT_BY_CONTENT_TYPE } from "./s3.js";
 import multer from "multer";
+// archiver v8 is pure ESM and exports format classes (no callable default).
+import { ZipArchive } from "archiver";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -63,7 +65,7 @@ app.post("/api/login", async (req, res) => {
 // --- Dashboard stats ---
 app.get("/api/stats", requireAdmin, async (_req, res) => {
   try {
-    const [userCount, orderCount, revenueAgg, referralAgg, statusAgg] = await Promise.all([
+    const [userCount, orderCount, revenueAgg, referralAgg, statusAgg, paymentStatusAgg] = await Promise.all([
       User.countDocuments({}),
       Order.countDocuments({}),
       Order.aggregate([
@@ -72,15 +74,19 @@ app.get("/api/stats", requireAdmin, async (_req, res) => {
       ]),
       User.aggregate([{ $group: { _id: null, total: { $sum: "$walletBalance" } } }]),
       Order.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+      Order.aggregate([{ $group: { _id: "$paymentStatus", count: { $sum: 1 } } }]),
     ]);
     const statusCounts = {};
     statusAgg.forEach((s) => (statusCounts[s._id || "unknown"] = s.count));
+    const paymentStatusCounts = {};
+    paymentStatusAgg.forEach((p) => (paymentStatusCounts[p._id || "unpaid"] = p.count));
     res.json({
       users: userCount,
       orders: orderCount,
       revenue: revenueAgg[0]?.total ?? 0,
       referralPayouts: referralAgg[0]?.total ?? 0,
       statusCounts,
+      paymentStatusCounts,
     });
   } catch (err) {
     console.error(err);
@@ -118,6 +124,7 @@ app.get("/api/orders", requireAdmin, async (req, res) => {
   try {
     const filter = {};
     if (req.query.status) filter.status = String(req.query.status);
+    if (req.query.paymentStatus) filter.paymentStatus = String(req.query.paymentStatus);
     const orders = await Order.find(filter)
       .populate("user", "name email phone")
       .populate("referrer", "name email referralCode")
@@ -186,7 +193,7 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
 app.patch("/api/orders/:id/payment", requireAdmin, async (req, res) => {
   try {
     const paymentStatus = String(req.body.paymentStatus || "");
-    if (!["unpaid", "paid", "refunded"].includes(paymentStatus)) {
+    if (!["unpaid", "paid", "failed", "refunded"].includes(paymentStatus)) {
       return res.status(400).json({ error: "Invalid payment status." });
     }
     const order = await Order.findByIdAndUpdate(
@@ -199,6 +206,98 @@ app.patch("/api/orders/:id/payment", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to update payment." });
+  }
+});
+
+// Get a single order (full detail for the order view page).
+app.get("/api/orders/:id", requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id)
+      .populate("user", "name email phone")
+      .populate("referrer", "name email referralCode")
+      .lean();
+    if (!order) return res.status(404).json({ error: "Order not found." });
+    res.json({ order });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load order." });
+  }
+});
+
+// Save an internal admin note on an order.
+app.patch("/api/orders/:id/note", requireAdmin, async (req, res) => {
+  try {
+    const adminNote = String(req.body.adminNote ?? "").slice(0, 5000);
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { adminNote },
+      { new: true }
+    );
+    if (!order) return res.status(404).json({ error: "Order not found." });
+    res.json({ ok: true, adminNote: order.adminNote });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to save note." });
+  }
+});
+
+// Download all photos for an order as a single ZIP, streamed from S3.
+app.get("/api/orders/:id/images.zip", requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).lean();
+    if (!order) return res.status(404).json({ error: "Order not found." });
+
+    const images = Array.isArray(order.images) ? order.images : [];
+    if (images.length === 0) {
+      return res.status(404).json({ error: "This order has no photos." });
+    }
+
+    const shortId = String(order._id).slice(-8);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="order-${shortId}-photos.zip"`
+    );
+
+    const archive = new ZipArchive({ zlib: { level: 6 } });
+    archive.on("error", (err) => {
+      console.error("zip error", err);
+      // Headers may already be sent; just tear down the stream.
+      try {
+        res.destroy(err);
+      } catch {
+        /* noop */
+      }
+    });
+    archive.pipe(res);
+
+    let added = 0;
+    for (let i = 0; i < images.length; i++) {
+      const key = keyFromImageUrl(images[i]);
+      if (!key) continue;
+      try {
+        const obj = await getS3Object(key);
+        const ext = EXT_BY_CONTENT_TYPE[obj.contentType] || "jpg";
+        archive.append(obj.bytes, { name: `photo-${i + 1}.${ext}` });
+        added += 1;
+      } catch (e) {
+        console.error("zip: failed to fetch", key, e.message);
+      }
+    }
+
+    if (added === 0) {
+      // Nothing could be fetched; abort with a clear error before finalizing.
+      archive.abort();
+      if (!res.headersSent) {
+        return res.status(502).json({ error: "Could not fetch any photos from storage." });
+      }
+      return res.end();
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: "Failed to build ZIP." });
   }
 });
 
@@ -233,6 +332,102 @@ app.get("/api/referrals", requireAdmin, async (_req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load referrals." });
+  }
+});
+
+// --- Coupons ---
+const COUPON_TYPES = ["percent", "flat"];
+
+function randomCouponCode(len = 8) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+app.get("/api/coupons", requireAdmin, async (_req, res) => {
+  try {
+    const coupons = await Coupon.find({}).sort({ createdAt: -1 }).lean();
+    res.json({ coupons });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load coupons." });
+  }
+});
+
+app.post("/api/coupons", requireAdmin, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const type = String(b.type || "");
+    if (!COUPON_TYPES.includes(type)) {
+      return res.status(400).json({ error: "Type must be 'percent' or 'flat'." });
+    }
+    const value = Number(b.value);
+    if (!Number.isFinite(value) || value <= 0) {
+      return res.status(400).json({ error: "Enter a valid discount value." });
+    }
+    if (type === "percent" && value > 100) {
+      return res.status(400).json({ error: "Percentage cannot exceed 100." });
+    }
+
+    // Use provided code or auto-generate a unique one.
+    let code = String(b.code || "").trim().toUpperCase().replace(/\s+/g, "");
+    if (code) {
+      const existing = await Coupon.findOne({ code });
+      if (existing) return res.status(409).json({ error: "That coupon code already exists." });
+    } else {
+      // Generate until unique.
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        code = randomCouponCode();
+        if (!(await Coupon.findOne({ code }))) break;
+      }
+    }
+
+    const coupon = await Coupon.create({
+      code,
+      type,
+      value,
+      maxDiscount: Number(b.maxDiscount) > 0 ? Number(b.maxDiscount) : 0,
+      minOrderValue: Number(b.minOrderValue) > 0 ? Number(b.minOrderValue) : 0,
+      usageLimit: Number(b.usageLimit) > 0 ? Number(b.usageLimit) : 0,
+      active: b.active !== false,
+      expiresAt: b.expiresAt ? new Date(b.expiresAt) : null,
+    });
+    res.json({ coupon });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create coupon." });
+  }
+});
+
+app.patch("/api/coupons/:id", requireAdmin, async (req, res) => {
+  try {
+    const update = {};
+    const b = req.body || {};
+    if (b.active !== undefined) update.active = !!b.active;
+    if (b.expiresAt !== undefined) update.expiresAt = b.expiresAt ? new Date(b.expiresAt) : null;
+    if (b.usageLimit !== undefined) update.usageLimit = Number(b.usageLimit) > 0 ? Number(b.usageLimit) : 0;
+    if (b.minOrderValue !== undefined) update.minOrderValue = Number(b.minOrderValue) > 0 ? Number(b.minOrderValue) : 0;
+    if (b.maxDiscount !== undefined) update.maxDiscount = Number(b.maxDiscount) > 0 ? Number(b.maxDiscount) : 0;
+
+    const coupon = await Coupon.findByIdAndUpdate(req.params.id, update, { new: true });
+    if (!coupon) return res.status(404).json({ error: "Coupon not found." });
+    res.json({ coupon });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to update coupon." });
+  }
+});
+
+app.delete("/api/coupons/:id", requireAdmin, async (req, res) => {
+  try {
+    const coupon = await Coupon.findByIdAndDelete(req.params.id);
+    if (!coupon) return res.status(404).json({ error: "Coupon not found." });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete coupon." });
   }
 });
 

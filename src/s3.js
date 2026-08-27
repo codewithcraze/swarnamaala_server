@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 
 const REGION = process.env.REGION || "us-east-1";
 const BUCKET = process.env.BUCKETNAME || "";
@@ -25,6 +25,8 @@ const EXT_BY_TYPE = {
   "image/gif": "gif",
 };
 
+export const EXT_BY_CONTENT_TYPE = EXT_BY_TYPE;
+
 export async function uploadBuffer(buffer, contentType) {
   if (!s3) throw new Error("S3 is not configured on the CRM backend.");
   const ext = EXT_BY_TYPE[contentType] || "jpg";
@@ -34,4 +36,26 @@ export async function uploadBuffer(buffer, contentType) {
   );
   // Absolute URL served through the main site's image proxy.
   return `${SITE_URL}/api/images/${key}`;
+}
+
+// Extract the S3 object key from a stored image value. Images are stored either
+// as an absolute proxy URL (".../api/images/uploads/xxx.jpg") or, in older data,
+// a relative path ("/api/images/uploads/xxx.jpg"). Returns null if the value
+// doesn't resolve to a safe "uploads/..." key.
+export function keyFromImageUrl(url) {
+  if (!url) return null;
+  const marker = "/api/images/";
+  const idx = url.indexOf(marker);
+  let key = idx >= 0 ? url.slice(idx + marker.length) : url;
+  key = key.replace(/^\/+/, "").split("?")[0];
+  if (!key.startsWith("uploads/") || key.includes("..")) return null;
+  return key;
+}
+
+// Fetch an object's bytes + content type directly from S3.
+export async function getS3Object(key) {
+  if (!s3) throw new Error("S3 is not configured on the CRM backend.");
+  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  const bytes = Buffer.from(await res.Body.transformToByteArray());
+  return { bytes, contentType: res.ContentType || "application/octet-stream" };
 }
