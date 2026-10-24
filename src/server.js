@@ -5,7 +5,7 @@ import bcrypt from "bcryptjs";
 import { connectDB } from "./db.js";
 import { User, Order, Blog, Coupon } from "./models.js";
 import { signAdminToken, requireAdmin } from "./auth.js";
-import { uploadBuffer, getS3Object, keyFromImageUrl, EXT_BY_CONTENT_TYPE } from "./s3.js";
+import { uploadBuffer, getS3Object, keyFromImageUrl, EXT_BY_CONTENT_TYPE, deleteImagesByUrl } from "./s3.js";
 import { sendMail, orderStatusEmail } from "./mail.js";
 import multer from "multer";
 // archiver v8 is pure ESM and exports format classes (no callable default).
@@ -275,6 +275,38 @@ app.patch("/api/orders/:id/note", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to save note." });
+  }
+});
+
+// Delete an order and its uploaded photos from S3.
+// Reverses any referral reward that was already credited so wallet balances
+// stay consistent.
+app.delete("/api/orders/:id", requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found." });
+
+    // Reverse a previously-credited referral reward before removing the order.
+    if (order.referralCredited && order.referrer && order.referralReward > 0) {
+      await User.findByIdAndUpdate(order.referrer, {
+        $inc: { walletBalance: -order.referralReward },
+      });
+    }
+
+    // Best-effort removal of the order's photos from S3.
+    let deletedImages = 0;
+    try {
+      deletedImages = await deleteImagesByUrl(order.images);
+    } catch (e) {
+      console.error("order delete: image cleanup failed", e?.message || e);
+    }
+
+    await Order.deleteOne({ _id: order._id });
+
+    res.json({ ok: true, deletedImages });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete order." });
   }
 });
 

@@ -1,5 +1,10 @@
 import crypto from "node:crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectsCommand,
+} from "@aws-sdk/client-s3";
 
 const REGION = process.env.REGION || "us-east-1";
 const BUCKET = process.env.BUCKETNAME || "";
@@ -58,4 +63,36 @@ export async function getS3Object(key) {
   const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
   const bytes = Buffer.from(await res.Body.transformToByteArray());
   return { bytes, contentType: res.ContentType || "application/octet-stream" };
+}
+
+// Delete objects from S3 given a list of stored image URLs/paths. Only keys
+// that resolve to a safe "uploads/..." path are deleted. Returns the number of
+// objects requested for deletion. Best-effort: logs but doesn't throw so the
+// caller can still delete the order even if storage cleanup partly fails.
+export async function deleteImagesByUrl(imageUrls) {
+  if (!s3) {
+    console.warn("[s3] not configured — skipping image deletion.");
+    return 0;
+  }
+  const keys = (Array.isArray(imageUrls) ? imageUrls : [])
+    .map((u) => keyFromImageUrl(u))
+    .filter(Boolean);
+  if (keys.length === 0) return 0;
+
+  // DeleteObjects handles up to 1000 keys per request; batch to be safe.
+  const BATCH = 1000;
+  for (let i = 0; i < keys.length; i += BATCH) {
+    const chunk = keys.slice(i, i + BATCH);
+    try {
+      await s3.send(
+        new DeleteObjectsCommand({
+          Bucket: BUCKET,
+          Delete: { Objects: chunk.map((Key) => ({ Key })), Quiet: true },
+        })
+      );
+    } catch (err) {
+      console.error("[s3] delete batch failed:", err?.message || err);
+    }
+  }
+  return keys.length;
 }
