@@ -66,7 +66,7 @@ app.post("/api/login", async (req, res) => {
 // --- Dashboard stats ---
 app.get("/api/stats", requireAdmin, async (_req, res) => {
   try {
-    const [userCount, orderCount, revenueAgg, referralAgg, statusAgg, paymentStatusAgg] = await Promise.all([
+    const [userCount, orderCount, revenueAgg, referralAgg, statusAgg, paymentStatusAgg, sourceAgg] = await Promise.all([
       User.countDocuments({}),
       Order.countDocuments({}),
       Order.aggregate([
@@ -76,7 +76,11 @@ app.get("/api/stats", requireAdmin, async (_req, res) => {
       User.aggregate([{ $group: { _id: null, total: { $sum: "$walletBalance" } } }]),
       Order.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
       Order.aggregate([{ $group: { _id: "$paymentStatus", count: { $sum: 1 } } }]),
+      // Older orders have no source: they came from the main site.
+      Order.aggregate([{ $group: { _id: { $ifNull: ["$source", "website"] }, count: { $sum: 1 } } }]),
     ]);
+    const sourceCounts = {};
+    sourceAgg.forEach((s) => (sourceCounts[s._id || "website"] = s.count));
     const statusCounts = {};
     statusAgg.forEach((s) => (statusCounts[s._id || "unknown"] = s.count));
     const paymentStatusCounts = {};
@@ -88,6 +92,7 @@ app.get("/api/stats", requireAdmin, async (_req, res) => {
       referralPayouts: referralAgg[0]?.total ?? 0,
       statusCounts,
       paymentStatusCounts,
+      sourceCounts,
     });
   } catch (err) {
     console.error(err);
@@ -142,6 +147,18 @@ app.get("/api/orders", requireAdmin, async (req, res) => {
     const filter = {};
     if (req.query.status) filter.status = String(req.query.status);
     if (req.query.paymentStatus) filter.paymentStatus = String(req.query.paymentStatus);
+    // Order source: "website" (incl. older orders without a source) or a platform id.
+    if (req.query.source) {
+      const source = String(req.query.source);
+      if (source === "website") filter.source = { $in: ["website", null] };
+      else if (source === "marketplace") filter.source = { $nin: ["website", null] };
+      else filter.source = source;
+    }
+    // Search by the platform's order id.
+    if (req.query.externalOrderId) {
+      const q = String(req.query.externalOrderId).trim().toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (q) filter.externalOrderId = { $regex: q };
+    }
 
     const [orders, total] = await Promise.all([
       Order.find(filter)

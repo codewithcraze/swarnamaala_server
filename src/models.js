@@ -45,6 +45,13 @@ const OrderSchema = new Schema(
     currency: String,
     couponCode: String,
     discount: { type: Number, default: 0 },
+    // "online" | "cod" | "marketplace"
+    paymentMethod: String,
+    codFee: { type: Number, default: 0 },
+    // "website" or the selling platform (meesho, flipkart, amazon, ...).
+    source: { type: String, default: "website" },
+    // The platform's own order id, for marketplace orders.
+    externalOrderId: String,
     images: [String],
     note: String,
     // Internal note added by CRM admins (not visible to the customer).
