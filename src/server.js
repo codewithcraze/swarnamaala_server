@@ -6,6 +6,7 @@ import { connectDB } from "./db.js";
 import { User, Order, Blog, Coupon } from "./models.js";
 import { signAdminToken, requireAdmin } from "./auth.js";
 import { uploadBuffer, getS3Object, keyFromImageUrl, EXT_BY_CONTENT_TYPE } from "./s3.js";
+import { sendMail, orderStatusEmail } from "./mail.js";
 import multer from "multer";
 // archiver v8 is pure ESM and exports format classes (no callable default).
 import { ZipArchive } from "archiver";
@@ -94,43 +95,66 @@ app.get("/api/stats", requireAdmin, async (_req, res) => {
   }
 });
 
-// --- Users (with day-wise grouping) ---
-app.get("/api/users", requireAdmin, async (_req, res) => {
+// Clamp pagination params to safe bounds. Returns { page, limit, skip }.
+function parsePagination(query, { defaultLimit = 20, maxLimit = 100 } = {}) {
+  let page = parseInt(query.page, 10);
+  let limit = parseInt(query.limit, 10);
+  if (!Number.isFinite(page) || page < 1) page = 1;
+  if (!Number.isFinite(limit) || limit < 1) limit = defaultLimit;
+  if (limit > maxLimit) limit = maxLimit;
+  return { page, limit, skip: (page - 1) * limit };
+}
+
+// --- Users (paginated, with optional text search) ---
+app.get("/api/users", requireAdmin, async (req, res) => {
   try {
-    const users = await User.find({})
-      .select("name email phone createdAt referralCode walletBalance referredBy")
-      .sort({ createdAt: -1 })
-      .lean();
+    const { page, limit, skip } = parsePagination(req.query);
 
-    // Group by registration day (YYYY-MM-DD).
-    const groups = {};
-    for (const u of users) {
-      const day = new Date(u.createdAt).toISOString().slice(0, 10);
-      (groups[day] ||= []).push(u);
+    const filter = {};
+    const search = String(req.query.search || "").trim();
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ name: rx }, { email: rx }, { phone: rx }, { referralCode: rx }];
     }
-    const daywise = Object.entries(groups)
-      .map(([date, list]) => ({ date, count: list.length, users: list }))
-      .sort((a, b) => (a.date < b.date ? 1 : -1));
 
-    res.json({ total: users.length, daywise });
+    const [users, total] = await Promise.all([
+      User.find(filter)
+        .select("name email phone createdAt referralCode walletBalance referredBy")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({ users, total, page, limit, pages: Math.ceil(total / limit) || 1 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load users." });
   }
 });
 
-// --- Orders ---
+// --- Orders (paginated, filterable) ---
 app.get("/api/orders", requireAdmin, async (req, res) => {
   try {
+    const { page, limit, skip } = parsePagination(req.query);
+
     const filter = {};
     if (req.query.status) filter.status = String(req.query.status);
     if (req.query.paymentStatus) filter.paymentStatus = String(req.query.paymentStatus);
-    const orders = await Order.find(filter)
-      .populate("user", "name email phone")
-      .populate("referrer", "name email referralCode")
-      .sort({ createdAt: -1 })
-      .lean();
-    res.json({ orders });
+
+    const [orders, total] = await Promise.all([
+      Order.find(filter)
+        .populate("user", "name email phone")
+        .populate("referrer", "name email referralCode")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Order.countDocuments(filter),
+    ]);
+
+    res.json({ orders, total, page, limit, pages: Math.ceil(total / limit) || 1 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to load orders." });
@@ -146,9 +170,10 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
     if (!VALID_STATUS.includes(status)) {
       return res.status(400).json({ error: "Invalid status." });
     }
-    const order = await Order.findById(req.params.id);
+    const order = await Order.findById(req.params.id).populate("user", "name email");
     if (!order) return res.status(404).json({ error: "Order not found." });
 
+    const previousStatus = order.status;
     const wasDelivered = order.status === "delivered";
     order.status = status;
 
@@ -182,6 +207,17 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
     }
 
     await order.save();
+
+    // Notify the customer when the status actually changes.
+    if (status !== previousStatus && order.user?.email) {
+      const { subject, html } = orderStatusEmail({
+        name: order.user.name,
+        orderId: order._id,
+        status,
+      });
+      sendMail({ to: order.user.email, subject, html }).catch(() => {});
+    }
+
     res.json({ ok: true, status: order.status, referralCredited: order.referralCredited });
   } catch (err) {
     console.error(err);
