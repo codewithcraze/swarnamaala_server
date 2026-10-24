@@ -208,14 +208,15 @@ app.patch("/api/orders/:id/status", requireAdmin, async (req, res) => {
 
     await order.save();
 
-    // Notify the customer when the status actually changes.
+    // Notify the customer when the status actually changes. Awaited so we can
+    // log the outcome; sendMail never throws.
     if (status !== previousStatus && order.user?.email) {
       const { subject, html } = orderStatusEmail({
         name: order.user.name,
         orderId: order._id,
         status,
       });
-      sendMail({ to: order.user.email, subject, html }).catch(() => {});
+      await sendMail({ to: order.user.email, subject, html });
     }
 
     res.json({ ok: true, status: order.status, referralCredited: order.referralCredited });

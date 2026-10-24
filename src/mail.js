@@ -32,13 +32,14 @@ export async function sendMail({ to, subject, html, text }) {
   const tx = getTransporter();
   if (!tx) return { ok: false, skipped: "not-configured" };
   try {
-    await tx.sendMail({
+    const info = await tx.sendMail({
       from: MAIL_FROM,
       to,
       subject,
       html,
       text: text || html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
     });
+    console.log(`[mail] sent "${subject}" to ${to} (id: ${info.messageId})`);
     return { ok: true };
   } catch (err) {
     console.error("[mail] send failed:", err?.message || err);
