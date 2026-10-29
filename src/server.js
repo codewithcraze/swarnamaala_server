@@ -6,7 +6,8 @@ import { connectDB } from "./db.js";
 import { User, Order, Blog, Coupon } from "./models.js";
 import { signAdminToken, requireAdmin } from "./auth.js";
 import { uploadBuffer, getS3Object, keyFromImageUrl, EXT_BY_CONTENT_TYPE, deleteImagesByUrl } from "./s3.js";
-import { sendMail, orderStatusEmail } from "./mail.js";
+import crypto from "node:crypto";
+import { sendMail, orderStatusEmail, passwordResetEmail, mailConfigured } from "./mail.js";
 import multer from "multer";
 // archiver v8 is pure ESM and exports format classes (no callable default).
 import { ZipArchive } from "archiver";
@@ -124,7 +125,7 @@ app.get("/api/users", requireAdmin, async (req, res) => {
 
     const [users, total] = await Promise.all([
       User.find(filter)
-        .select("name email phone createdAt referralCode walletBalance referredBy")
+        .select("name email phone role createdAt referralCode walletBalance referredBy")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -271,6 +272,7 @@ app.get("/api/orders/:id", requireAdmin, async (req, res) => {
       .populate("referrer", "name email referralCode")
       .lean();
     if (!order) return res.status(404).json({ error: "Order not found." });
+    order.adminNotes = notesView(order);
     res.json({ order });
   } catch (err) {
     console.error(err);
@@ -278,20 +280,287 @@ app.get("/api/orders/:id", requireAdmin, async (req, res) => {
   }
 });
 
-// Save an internal admin note on an order.
-app.patch("/api/orders/:id/note", requireAdmin, async (req, res) => {
+// --- Internal admin notes (a list; newest shown first in the CRM) ---
+
+// Older orders stored one note in `adminNote`. Move it into the list the first
+// time the notes are changed so nothing is lost.
+function migrateLegacyNote(order) {
+  if (order.adminNote && (!order.adminNotes || order.adminNotes.length === 0)) {
+    order.adminNotes = [{ text: order.adminNote, author: "", createdAt: order.updatedAt || order.createdAt }];
+  }
+  order.adminNote = undefined;
+}
+
+// Notes as the CRM should see them, including an unmigrated legacy note.
+function notesView(order) {
+  const notes = Array.isArray(order.adminNotes) ? order.adminNotes : [];
+  if (notes.length === 0 && order.adminNote) {
+    return [{ _id: "legacy", text: order.adminNote, author: "", createdAt: order.updatedAt || order.createdAt }];
+  }
+  return notes;
+}
+
+app.post("/api/orders/:id/notes", requireAdmin, async (req, res) => {
   try {
-    const adminNote = String(req.body.adminNote ?? "").slice(0, 5000);
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { adminNote },
-      { new: true }
-    );
+    const text = String(req.body.text ?? "").trim().slice(0, 5000);
+    if (!text) return res.status(400).json({ error: "Write a note first." });
+    const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found." });
-    res.json({ ok: true, adminNote: order.adminNote });
+    migrateLegacyNote(order);
+    order.adminNotes.push({ text, author: req.admin?.email || "", createdAt: new Date() });
+    await order.save();
+    res.json({ ok: true, adminNotes: order.adminNotes });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to save note." });
+  }
+});
+
+app.delete("/api/orders/:id/notes/:noteId", requireAdmin, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found." });
+    if (req.params.noteId === "legacy") {
+      order.adminNote = undefined;
+    } else {
+      migrateLegacyNote(order);
+      const before = order.adminNotes.length;
+      order.adminNotes = order.adminNotes.filter((n) => String(n._id) !== req.params.noteId);
+      if (order.adminNotes.length === before) return res.status(404).json({ error: "Note not found." });
+    }
+    await order.save();
+    res.json({ ok: true, adminNotes: notesView(order) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete note." });
+  }
+});
+
+// --- Edit order details ---
+const clip = (v, max) => String(v ?? "").trim().slice(0, max);
+const PHONE_RX = /^\+?[0-9][0-9\s-]{6,16}$/;
+const EMAIL_RX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const ADDRESS_FIELDS = ["fullName", "phone", "line1", "line2", "city", "state", "pincode"];
+
+app.patch("/api/orders/:id", requireAdmin, async (req, res) => {
+  const bad = (error) => res.status(400).json({ error });
+  try {
+    const b = req.body || {};
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found." });
+
+    if (b.product !== undefined) {
+      const v = clip(b.product, 120);
+      if (!v) return bad("Product name is required.");
+      order.product = v;
+    }
+    if (b.unitLabel !== undefined) order.unitLabel = clip(b.unitLabel, 120);
+    if (b.quantity !== undefined) {
+      const q = Number(b.quantity);
+      if (!Number.isInteger(q) || q < 1 || q > 1000) return bad("Quantity must be a whole number from 1 to 1000.");
+      order.quantity = q;
+    }
+    if (b.note !== undefined) order.note = clip(b.note, 2000);
+
+    for (const k of ["subtotal", "gst", "discount", "total"]) {
+      if (b[k] === undefined || b[k] === "") continue;
+      const n = Number(b[k]);
+      if (!Number.isFinite(n) || n < 0) return bad(`${k} must be zero or more.`);
+      order[k] = Math.round(n * 100) / 100;
+    }
+    if (b.total !== undefined && b.total !== "") order.amount = order.total;
+    if (b.couponCode !== undefined) order.couponCode = clip(b.couponCode, 40).toUpperCase() || null;
+
+    if (b.source !== undefined) {
+      const s = clip(b.source, 30).toLowerCase();
+      if (!/^[a-z0-9_-]+$/.test(s)) return bad("Invalid order source.");
+      order.source = s;
+    }
+    if (b.externalOrderId !== undefined) {
+      order.externalOrderId = clip(b.externalOrderId, 80).toUpperCase() || undefined;
+    }
+    const isWebsite = !order.source || order.source === "website";
+    if (!isWebsite && !order.externalOrderId) return bad("Marketplace orders need the platform order ID.");
+    if (isWebsite) order.externalOrderId = undefined;
+
+    if (b.shippingAddress !== undefined) {
+      const a = b.shippingAddress || {};
+      const next = {};
+      for (const f of ADDRESS_FIELDS) next[f] = clip(a[f], 200);
+      const any = ADDRESS_FIELDS.some((f) => next[f]);
+      if (any) {
+        if (next.pincode && !/^\d{6}$/.test(next.pincode)) return bad("Pincode must be 6 digits.");
+        if (next.phone && !PHONE_RX.test(next.phone)) return bad("Enter a valid shipping phone number.");
+      }
+      order.shippingAddress = any ? next : undefined;
+    }
+    // The main site requires a full address on website orders.
+    if (isWebsite) {
+      const a = order.shippingAddress || {};
+      const missing = ["fullName", "phone", "line1", "city", "state", "pincode"].filter((f) => !a[f]);
+      if (missing.length) return bad("Website orders need a full shipping address (name, phone, address, city, state, pincode).");
+    }
+
+    await order.save();
+    const fresh = await Order.findById(order._id)
+      .populate("user", "name email phone")
+      .populate("referrer", "name email referralCode")
+      .lean();
+    fresh.adminNotes = notesView(fresh);
+    res.json({ ok: true, order: fresh });
+  } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: "Another order already uses this platform order ID." });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Failed to update order." });
+  }
+});
+
+// --- Edit a customer's contact details ---
+app.patch("/api/users/:id", requireAdmin, async (req, res) => {
+  const bad = (error) => res.status(400).json({ error });
+  try {
+    const b = req.body || {};
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "Customer not found." });
+
+    if (b.name !== undefined) {
+      const v = clip(b.name, 120);
+      if (!v) return bad("Name is required.");
+      user.name = v;
+    }
+    if (b.email !== undefined) {
+      const email = clip(b.email, 200).toLowerCase();
+      if (!EMAIL_RX.test(email)) return bad("Enter a valid email address.");
+      if (email !== user.email) {
+        const taken = await User.exists({ email, _id: { $ne: user._id } });
+        if (taken) return res.status(409).json({ error: "Another account already uses this email." });
+        user.email = email;
+      }
+    }
+    if (b.phone !== undefined) {
+      const phone = clip(b.phone, 20);
+      if (phone && !PHONE_RX.test(phone)) return bad("Enter a valid phone number.");
+      user.phone = phone || undefined;
+    }
+
+    await user.save();
+    res.json({ ok: true, user: { _id: user._id, name: user.name, email: user.email, phone: user.phone } });
+  } catch (err) {
+    if (err?.code === 11000) return res.status(409).json({ error: "Another account already uses this email." });
+    console.error(err);
+    res.status(500).json({ error: "Failed to update customer." });
+  }
+});
+
+// What deleting a user would remove, so the CRM can warn before confirming.
+app.get("/api/users/:id/summary", requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id).select("name email role").lean();
+    if (!user) return res.status(404).json({ error: "Customer not found." });
+    const [orders, referredCount] = await Promise.all([
+      Order.find({ user: user._id }).select("images").lean(),
+      User.countDocuments({ referredBy: user._id }),
+    ]);
+    const photoCount = orders.reduce((n, o) => n + (o.images?.length || 0), 0);
+    res.json({ user, orderCount: orders.length, photoCount, referredCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load customer." });
+  }
+});
+
+// Delete a user. Their orders (and the orders' photos in S3) are only removed
+// when ?withOrders=1 is passed; otherwise a user with orders can't be deleted,
+// because orders on the main site must belong to a user.
+app.delete("/api/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ error: "Customer not found." });
+    if (user.role === "admin") {
+      return res.status(403).json({ error: "Admin accounts can't be deleted from the CRM." });
+    }
+
+    const orders = await Order.find({ user: user._id });
+    const withOrders = req.query.withOrders === "1";
+    if (orders.length > 0 && !withOrders) {
+      return res.status(409).json({
+        error: `This customer has ${orders.length} order${orders.length === 1 ? "" : "s"}. Tick "also delete their orders" to remove them too.`,
+      });
+    }
+
+    let deletedImages = 0;
+    for (const order of orders) {
+      // Take back a referral reward someone else earned from this order.
+      if (order.referralCredited && order.referrer && order.referralReward > 0) {
+        await User.findByIdAndUpdate(order.referrer, { $inc: { walletBalance: -order.referralReward } });
+      }
+      try {
+        deletedImages += await deleteImagesByUrl(order.images);
+      } catch (e) {
+        console.error("user delete: image cleanup failed", e?.message || e);
+      }
+    }
+    if (orders.length) await Order.deleteMany({ _id: { $in: orders.map((o) => o._id) } });
+
+    // Detach references to this user elsewhere.
+    await Promise.all([
+      User.updateMany({ referredBy: user._id }, { $set: { referredBy: null } }),
+      Order.updateMany({ referrer: user._id }, { $set: { referrer: null } }),
+    ]);
+
+    await User.deleteOne({ _id: user._id });
+    console.log(`[crm] user ${user.email} deleted by ${req.admin?.email} (${orders.length} orders, ${deletedImages} photos)`);
+    res.json({ ok: true, deletedOrders: orders.length, deletedImages });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to delete customer." });
+  }
+});
+
+// Readable random password without look-alike characters.
+function generatePassword(len = 12) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[crypto.randomInt(chars.length)];
+  return out;
+}
+
+// Reset a customer's password and email them the new one. The password is
+// never returned to the admin. If the email can't be sent, the old password is
+// restored so the customer isn't locked out.
+app.post("/api/users/:id/reset-password", requireAdmin, async (req, res) => {
+  try {
+    if (!mailConfigured()) {
+      return res.status(503).json({
+        error: "Email isn't set up on the server (MAIL_USER / APPPASSCODE), so the new password can't be sent.",
+      });
+    }
+    const user = await User.findById(req.params.id).select("name email passwordHash").lean();
+    if (!user) return res.status(404).json({ error: "Customer not found." });
+    if (!user.email) return res.status(400).json({ error: "This customer has no email address." });
+
+    const password = generatePassword();
+    const passwordHash = await bcrypt.hash(password, 12);
+    await User.updateOne({ _id: user._id }, { $set: { passwordHash } });
+
+    const { subject, html } = passwordResetEmail({
+      name: user.name,
+      email: user.email,
+      password,
+      siteUrl: process.env.SITE_URL,
+    });
+    const sent = await sendMail({ to: user.email, subject, html });
+    if (!sent.ok) {
+      await User.updateOne({ _id: user._id }, { $set: { passwordHash: user.passwordHash } });
+      return res.status(502).json({ error: "Couldn't send the email, so the password was not changed." });
+    }
+    console.log(`[crm] password reset for ${user.email} by ${req.admin?.email}`);
+    res.json({ ok: true, email: user.email });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to reset password." });
   }
 });
 

@@ -32,6 +32,13 @@ const ShippingAddressSchema = new Schema(
   { _id: false }
 );
 
+const AdminNoteSchema = new Schema(
+  {
+    text: { type: String, required: true },
+    author: String, // admin email
+    createdAt: { type: Date, default: Date.now },
+  }
+);
 const OrderSchema = new Schema(
   {
     user: { type: Schema.Types.ObjectId, ref: "User", index: true },
@@ -54,8 +61,11 @@ const OrderSchema = new Schema(
     externalOrderId: String,
     images: [String],
     note: String,
-    // Internal note added by CRM admins (not visible to the customer).
+    // Legacy single internal note. Kept so old orders still show it; new notes
+    // go into adminNotes and the legacy value is moved there on first edit.
     adminNote: String,
+    // Internal notes added by CRM admins (not visible to the customer).
+    adminNotes: [AdminNoteSchema],
     shippingAddress: ShippingAddressSchema,
     status: String,
     paymentStatus: String,

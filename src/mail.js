@@ -22,6 +22,10 @@ function getTransporter() {
   return transporter;
 }
 
+export function mailConfigured() {
+  return !!(MAIL_USER && APP_PASS);
+}
+
 /**
  * Send an email. Never throws — failures are logged so they don't break the
  * request that triggered them.
@@ -60,6 +64,26 @@ const SHELL = (inner) => `
       </p>
     </div>
   </div>`;
+
+const escapeHtml = (s) =>
+  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+// Sent when an admin resets a customer's password from the CRM.
+export function passwordResetEmail({ name, email, password, siteUrl }) {
+  const loginUrl = `${String(siteUrl || "https://www.swarnamaala.in").replace(/\/$/, "")}/signin`;
+  const subject = `Your ${BRAND} password has been reset`;
+  const html = SHELL(`
+    <p>Hi ${escapeHtml(name) || "there"},</p>
+    <p>Your ${BRAND} account password was reset by our support team. You can sign in with:</p>
+    <table style="border-collapse:collapse;margin:12px 0">
+      <tr><td style="padding:4px 12px 4px 0;color:#666">Email</td><td style="padding:4px 0"><strong>${escapeHtml(email)}</strong></td></tr>
+      <tr><td style="padding:4px 12px 4px 0;color:#666">New password</td><td style="padding:4px 0"><strong style="font-family:monospace;font-size:16px;letter-spacing:1px">${escapeHtml(password)}</strong></td></tr>
+    </table>
+    <p><a href="${loginUrl}" style="display:inline-block;background:#b8860b;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none">Sign in</a></p>
+    <p style="font-size:13px;color:#666">If you didn't ask for this, please contact us right away.</p>
+  `);
+  return { subject, html };
+}
 
 // Friendly label for each order status.
 const STATUS_COPY = {
