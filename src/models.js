@@ -118,7 +118,70 @@ const CouponSchema = new Schema(
   { timestamps: true }
 );
 
+// --- Email campaigns ---
+const CampaignRecipientSchema = new Schema(
+  {
+    email: String,
+    name: String,
+    status: { type: String, enum: ["pending", "sent", "failed", "skipped"], default: "pending" },
+    error: String,
+    sentAt: Date,
+  },
+  { _id: false }
+);
+const CampaignSchema = new Schema(
+  {
+    name: { type: String, required: true },
+    subject: { type: String, default: "" },
+    preheader: { type: String, default: "" },
+    html: { type: String, default: "" },
+    // all | buyers | nonBuyers | custom
+    audience: {
+      type: { type: String, default: "all" },
+      emails: [String],
+    },
+    status: { type: String, enum: ["draft", "sending", "paused", "sent"], default: "draft", index: true },
+    // Snapshot of who gets it, taken when sending starts. Excluded from list
+    // queries because it can be large.
+    recipients: { type: [CampaignRecipientSchema], select: false },
+    stats: {
+      total: { type: Number, default: 0 },
+      sent: { type: Number, default: 0 },
+      failed: { type: Number, default: 0 },
+      skipped: { type: Number, default: 0 },
+    },
+    // Stops two browser tabs from sending the same batch at once.
+    lockedUntil: Date,
+    createdBy: String,
+    startedAt: Date,
+    finishedAt: Date,
+  },
+  { timestamps: true }
+);
+// Images uploaded for campaigns, so they can be reused and copied as URLs.
+const MediaSchema = new Schema(
+  {
+    url: { type: String, required: true },
+    name: String,
+    size: Number,
+    contentType: String,
+    uploadedBy: String,
+  },
+  { timestamps: true }
+);
+// People who unsubscribed from marketing email. Never sent campaigns again.
+const SuppressionSchema = new Schema(
+  {
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    reason: { type: String, default: "unsubscribe" },
+  },
+  { timestamps: true }
+);
+
 export const User = models.User || model("User", UserSchema);
+export const Campaign = models.Campaign || model("Campaign", CampaignSchema);
+export const Media = models.Media || model("Media", MediaSchema);
+export const Suppression = models.Suppression || model("Suppression", SuppressionSchema);
 export const Order = models.Order || model("Order", OrderSchema);
 export const Blog = models.Blog || model("Blog", BlogSchema);
 export const Coupon = models.Coupon || model("Coupon", CouponSchema);

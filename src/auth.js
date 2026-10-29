@@ -2,6 +2,21 @@ import jwt from "jsonwebtoken";
 
 const SECRET = process.env.CRM_JWT_SECRET || "dev-crm-secret";
 
+// Token embedded in campaign unsubscribe links. No expiry: old emails must
+// keep working. Carries only the email address.
+export function signUnsubToken(email) {
+  return jwt.sign({ p: "unsub", e: String(email).toLowerCase() }, SECRET);
+}
+
+export function verifyUnsubToken(token) {
+  try {
+    const payload = jwt.verify(String(token || ""), SECRET);
+    return payload.p === "unsub" && payload.e ? payload.e : null;
+  } catch {
+    return null;
+  }
+}
+
 export function signAdminToken(email) {
   return jwt.sign({ role: "admin", email }, SECRET, { expiresIn: "12h" });
 }

@@ -14,12 +14,31 @@ function getTransporter() {
     return null;
   }
   if (!transporter) {
+    // Pooled: keep one logged-in SMTP connection open and reuse it, instead of
+    // connecting + authenticating for every message (~4 s each with Gmail).
     transporter = nodemailer.createTransport({
       service: "gmail",
+      pool: true,
+      maxConnections: 1,
+      maxMessages: 100,
       auth: { user: MAIL_USER, pass: APP_PASS },
     });
   }
   return transporter;
+}
+
+// Plain-text fallback: drop head/style/script blocks, then tags.
+export function htmlToText(html) {
+  return String(html || "")
+    .replace(/<(head|style|script)[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|tr|h[1-6]|li)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n\n")
+    .trim();
 }
 
 export function mailConfigured() {
@@ -31,7 +50,7 @@ export function mailConfigured() {
  * request that triggered them.
  * @param {{ to: string, subject: string, html: string, text?: string }} opts
  */
-export async function sendMail({ to, subject, html, text }) {
+export async function sendMail({ to, subject, html, text, headers, quiet }) {
   if (!to) return { ok: false, skipped: "no-recipient" };
   const tx = getTransporter();
   if (!tx) return { ok: false, skipped: "not-configured" };
@@ -41,8 +60,10 @@ export async function sendMail({ to, subject, html, text }) {
       to,
       subject,
       html,
-      text: text || html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+      text: text || htmlToText(html),
+      ...(headers ? { headers } : {}),
     });
+    if (quiet) return { ok: true };
     console.log(`[mail] sent "${subject}" to ${to} (id: ${info.messageId})`);
     return { ok: true };
   } catch (err) {

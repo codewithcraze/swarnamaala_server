@@ -11,11 +11,15 @@ import { sendMail, orderStatusEmail, passwordResetEmail, mailConfigured } from "
 import multer from "multer";
 // archiver v8 is pure ESM and exports format classes (no callable default).
 import { ZipArchive } from "archiver";
+import { registerCampaignRoutes } from "./campaigns.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
-app.use(express.json());
+// Behind a proxy (Vercel/Render/nginx) so req.protocol/host are the public ones.
+app.set("trust proxy", 1);
+// Campaign HTML can be a few hundred KB.
+app.use(express.json({ limit: "2mb" }));
 app.use(
   cors({
     origin: process.env.CRM_FRONTEND_ORIGIN?.split(",") ?? "*",
@@ -907,6 +911,8 @@ app.delete("/api/blogs/:id", requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to delete blog." });
   }
 });
+
+registerCampaignRoutes(app);
 
 connectDB(MONGODB_URI).then(() => {
   app.listen(PORT, () => console.log(`[crm] API listening on http://localhost:${PORT}`));
