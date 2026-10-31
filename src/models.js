@@ -59,6 +59,8 @@ const OrderSchema = new Schema(
     source: { type: String, default: "website" },
     // The platform's own order id, for marketplace orders.
     externalOrderId: String,
+    // Sales agent who took this order (set from the CRM).
+    agent: { type: Schema.Types.ObjectId, ref: "Agent", index: true, default: null },
     images: [String],
     note: String,
     // Legacy single internal note. Kept so old orders still show it; new notes
@@ -178,6 +180,18 @@ const SuppressionSchema = new Schema(
   { timestamps: true }
 );
 
+// Sales agents who take orders (phone/WhatsApp/marketplace). Managed in the CRM.
+const AgentSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    phone: { type: String, trim: true },
+    active: { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+AgentSchema.index({ name: 1 }, { unique: true, collation: { locale: "en", strength: 2 } });
+
+export const Agent = models.Agent || model("Agent", AgentSchema);
 export const User = models.User || model("User", UserSchema);
 export const Campaign = models.Campaign || model("Campaign", CampaignSchema);
 export const Media = models.Media || model("Media", MediaSchema);

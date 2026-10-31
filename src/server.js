@@ -12,6 +12,8 @@ import multer from "multer";
 // archiver v8 is pure ESM and exports format classes (no callable default).
 import { ZipArchive } from "archiver";
 import { registerCampaignRoutes } from "./campaigns.js";
+import { registerAgentRoutes } from "./agents.js";
+import mongoose from "mongoose";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
@@ -159,6 +161,13 @@ app.get("/api/orders", requireAdmin, async (req, res) => {
       else if (source === "marketplace") filter.source = { $nin: ["website", null] };
       else filter.source = source;
     }
+    // Agent who took the order: an agent id, or "none" for unassigned.
+    if (req.query.agent) {
+      const a = String(req.query.agent);
+      if (a === "none") filter.agent = null;
+      else if (mongoose.isValidObjectId(a)) filter.agent = a;
+      else return res.status(400).json({ error: "Invalid agent filter." });
+    }
     // Search by the platform's order id.
     if (req.query.externalOrderId) {
       const q = String(req.query.externalOrderId).trim().toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -169,6 +178,7 @@ app.get("/api/orders", requireAdmin, async (req, res) => {
       Order.find(filter)
         .populate("user", "name email phone")
         .populate("referrer", "name email referralCode")
+        .populate("agent", "name")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -274,6 +284,7 @@ app.get("/api/orders/:id", requireAdmin, async (req, res) => {
     const order = await Order.findById(req.params.id)
       .populate("user", "name email phone")
       .populate("referrer", "name email referralCode")
+        .populate("agent", "name")
       .lean();
     if (!order) return res.status(404).json({ error: "Order not found." });
     order.adminNotes = notesView(order);
@@ -409,6 +420,7 @@ app.patch("/api/orders/:id", requireAdmin, async (req, res) => {
     const fresh = await Order.findById(order._id)
       .populate("user", "name email phone")
       .populate("referrer", "name email referralCode")
+        .populate("agent", "name")
       .lean();
     fresh.adminNotes = notesView(fresh);
     res.json({ ok: true, order: fresh });
@@ -913,6 +925,7 @@ app.delete("/api/blogs/:id", requireAdmin, async (req, res) => {
 });
 
 registerCampaignRoutes(app);
+registerAgentRoutes(app);
 
 connectDB(MONGODB_URI).then(() => {
   app.listen(PORT, () => console.log(`[crm] API listening on http://localhost:${PORT}`));
